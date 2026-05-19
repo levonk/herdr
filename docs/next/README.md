@@ -27,6 +27,16 @@ curl -fsSL https://herdr.dev/install.sh | sh
 
 or download the binary from [releases](https://github.com/ogulcancelik/herdr/releases). requires linux or macos.
 
+### nix
+
+with flakes enabled:
+
+```bash
+nix profile install github:levonk/herdr
+```
+
+or add to your system flake inputs and home packages.
+
 ### update
 
 herdr notifies you when a new version is available. run manually to update:
