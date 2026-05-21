@@ -29,14 +29,21 @@ fn unique_test_dir() -> PathBuf {
 }
 
 struct SpawnedHerdr {
-    _master: Box<dyn MasterPty + Send>,
+    _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+}
+
+impl SpawnedHerdr {
+    fn close_master(&mut self) {
+        drop(self._master.take());
+    }
 }
 
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
+        self.close_master();
 
         if let Some(pid) = pid {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -127,7 +134,7 @@ fn spawn_server(
     drop(pair.slave);
 
     SpawnedHerdr {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
     }
 }
@@ -172,6 +179,7 @@ fn client_handshake(
             &encode_varint_u32(8),  // cell_width_px
             &encode_varint_u32(16), // cell_height_px
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
+            &encode_varint_u32(0),  // ClientKeybindings::Server
         ],
     );
     let framed = frame_message(&hello_payload);
@@ -440,6 +448,7 @@ fn server_removes_client_socket_on_exit() {
 
     // Kill the server.
     let _ = spawned.child.kill();
+    spawned.close_master();
     let _ = spawned.child.wait();
 
     // Give it a moment to clean up.
@@ -583,11 +592,11 @@ fn client_handshake_succeeds() {
     // Connect to the client socket and perform a handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
 
-    // Send Hello with version 8, 80 cols, 24 rows.
+    // Send Hello with the current protocol version, 80 cols, 24 rows.
     let (version, error) =
-        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+        client_handshake(&mut stream, 9, 80, 24).expect("handshake should succeed");
 
-    assert_eq!(version, 8, "server should report protocol version 8");
+    assert_eq!(version, 9, "server should report protocol version 9");
     assert!(
         error.is_none(),
         "handshake should not have an error: {:?}",
@@ -616,7 +625,7 @@ fn client_handshake_rejects_incompatible_version() {
     let (version, error) = client_handshake(&mut stream, 0, 80, 24)
         .expect("should read Welcome response even on rejection");
 
-    assert_eq!(version, 8, "server should report its version 8");
+    assert_eq!(version, 9, "server should report its version 9");
     assert!(
         error.is_some(),
         "version 0 should be rejected with an error"
@@ -641,10 +650,10 @@ fn client_handshake_clamps_small_terminal_size() {
     // Send Hello with 0x0 terminal size — should be clamped.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
 
-    let (version, error) = client_handshake(&mut stream, 8, 0, 0)
+    let (version, error) = client_handshake(&mut stream, 9, 0, 0)
         .expect("handshake with 0x0 should succeed (server clamps)");
 
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(
         error.is_none(),
         "0x0 size should be accepted (clamped): {:?}",
@@ -704,9 +713,9 @@ fn no_hello_client_closed_within_five_seconds() {
     // Verify the server is still healthy — a proper client can still connect.
     let mut good_stream =
         UnixStream::connect(&client_socket).expect("should connect after no-hello client");
-    let (version, error) = client_handshake(&mut good_stream, 8, 80, 24)
+    let (version, error) = client_handshake(&mut good_stream, 9, 80, 24)
         .expect("proper handshake should still work after no-hello client");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(error.is_none());
 
     // API should still work.

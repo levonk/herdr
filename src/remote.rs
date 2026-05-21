@@ -13,19 +13,47 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
+const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CURRENT_PROTOCOL: u32 = crate::server::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
+pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteKeybindings {
+    Local,
+    Server,
+}
+
+impl RemoteKeybindings {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(Self::Local),
+            "server" => Ok(Self::Server),
+            _ => Err("--remote-keybindings must be 'local' or 'server'".to_string()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Server => "server",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteLaunch {
     pub(crate) target: String,
+    pub(crate) keybindings: RemoteKeybindings,
 }
 
 pub(crate) fn extract_remote_args(
@@ -36,36 +64,63 @@ pub(crate) fn extract_remote_args(
         cleaned.push(program.clone());
     }
 
-    let mut remote = None;
+    let mut remote_target = None;
+    let mut keybindings = RemoteKeybindings::Local;
+    let mut keybindings_seen = false;
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
         if arg == "--remote" {
-            if remote.is_some() {
+            if remote_target.is_some() {
                 return Err("--remote can only be specified once".to_string());
             }
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --remote".to_string());
             };
-            remote = Some(RemoteLaunch {
-                target: validate_remote_target(value)?.to_owned(),
-            });
+            remote_target = Some(validate_remote_target(value)?.to_owned());
             index += 2;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--remote=") {
-            if remote.is_some() {
+            if remote_target.is_some() {
                 return Err("--remote can only be specified once".to_string());
             }
-            remote = Some(RemoteLaunch {
-                target: validate_remote_target(value)?.to_owned(),
-            });
+            remote_target = Some(validate_remote_target(value)?.to_owned());
+            index += 1;
+            continue;
+        }
+        if arg == "--remote-keybindings" {
+            if keybindings_seen {
+                return Err("--remote-keybindings can only be specified once".to_string());
+            }
+            let Some(value) = args.get(index + 1) else {
+                return Err("missing value for --remote-keybindings".to_string());
+            };
+            keybindings = RemoteKeybindings::parse(value)?;
+            keybindings_seen = true;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--remote-keybindings=") {
+            if keybindings_seen {
+                return Err("--remote-keybindings can only be specified once".to_string());
+            }
+            keybindings = RemoteKeybindings::parse(value)?;
+            keybindings_seen = true;
             index += 1;
             continue;
         }
 
         cleaned.push(arg.clone());
         index += 1;
+    }
+
+    let remote = remote_target.map(|target| RemoteLaunch {
+        target,
+        keybindings,
+    });
+    if remote.is_none() && keybindings_seen {
+        return Err("--remote-keybindings requires --remote".to_string());
     }
 
     Ok((cleaned, remote))
@@ -88,18 +143,23 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let program = std::env::args()
         .next()
         .unwrap_or_else(|| "herdr".to_string());
-    let reattach_command = reattach_command(&program, &remote.target, &session_name);
-    let remote_herdr = prepare_remote_herdr(&remote.target)?;
-    ensure_remote_server_compatible(&remote.target, &remote_herdr)?;
+    let reattach_command =
+        reattach_command(&program, &remote.target, &session_name, remote.keybindings);
+    let prepared_remote = prepare_remote_herdr(&remote.target)?;
+    ensure_remote_server_ready(
+        &remote.target,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+    )?;
 
     let _bridge = SshStdioBridge::start(
         remote.target,
-        remote_herdr,
+        prepared_remote.remote_herdr,
         local_socket.clone(),
         session_name,
     )?;
 
-    run_client_process(&local_socket, &reattach_command)
+    run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -141,7 +201,7 @@ fn ensure_remote_server_running() -> io::Result<()> {
             return Ok(());
         }
         return Err(io::Error::other(format!(
-            "remote herdr server is running with protocol {}, but this bridge needs protocol {CURRENT_PROTOCOL}; rerun `herdr --remote` from an interactive terminal to approve replacing it",
+            "remote herdr server is running with protocol {}, but this bridge needs protocol {CURRENT_PROTOCOL}; rerun `herdr --remote` from an interactive terminal to approve stopping it",
             protocol_label(status.protocol)
         )));
     }
@@ -231,6 +291,11 @@ struct InstallSource {
     temporary_dir: Option<PathBuf>,
 }
 
+struct PreparedRemoteHerdr {
+    remote_herdr: RemoteHerdr,
+    installed_or_replaced: bool,
+}
+
 impl InstallSource {
     fn persistent(path: PathBuf) -> Self {
         Self {
@@ -253,17 +318,23 @@ impl InstallSource {
     }
 }
 
-fn prepare_remote_herdr(target: &str) -> io::Result<RemoteHerdr> {
+fn prepare_remote_herdr(target: &str) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let override_binary = remote_binary_override_path()?;
 
     if override_binary.is_none() {
         if let Some(path_remote_herdr) = remote_binary_on_path(target, &remote_herdr)? {
-            return Ok(path_remote_herdr);
+            return Ok(PreparedRemoteHerdr {
+                remote_herdr: path_remote_herdr,
+                installed_or_replaced: false,
+            });
         }
         if remote_binary_matches(target, &remote_herdr)? {
-            return Ok(remote_herdr);
+            return Ok(PreparedRemoteHerdr {
+                remote_herdr,
+                installed_or_replaced: false,
+            });
         }
     }
 
@@ -285,7 +356,10 @@ fn prepare_remote_herdr(target: &str) -> io::Result<RemoteHerdr> {
     }
     warn_if_remote_bin_not_on_path(target)?;
 
-    Ok(remote_herdr)
+    Ok(PreparedRemoteHerdr {
+        remote_herdr,
+        installed_or_replaced: true,
+    })
 }
 
 fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
@@ -428,24 +502,59 @@ fn resolve_install_source(
     download_release_asset(platform)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteServerStatus {
-    Running { protocol: Option<u32> },
+    Running {
+        version: Option<String>,
+        protocol: Option<u32>,
+    },
     NotRunning,
 }
 
-fn ensure_remote_server_compatible(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteServerRestartReason {
+    ProtocolMismatch,
+    BinaryUpdated,
+    VersionMismatch,
+}
+
+fn ensure_remote_server_ready(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    remote_binary_changed: bool,
+) -> io::Result<()> {
     let status = remote_server_status(target, remote_herdr)?;
-    let RemoteServerStatus::Running { protocol } = status else {
+    let RemoteServerStatus::Running { version, protocol } = status else {
         return Ok(());
     };
 
-    if protocol == Some(CURRENT_PROTOCOL) {
+    let Some(reason) =
+        remote_server_restart_reason(version.as_deref(), protocol, remote_binary_changed)
+    else {
         return Ok(());
-    }
+    };
 
-    confirm_remote_server_stop(target, protocol)?;
-    stop_remote_server(target, remote_herdr)
+    if confirm_remote_server_stop(target, version.as_deref(), protocol, reason)? {
+        stop_remote_server(target, remote_herdr)?;
+    }
+    Ok(())
+}
+
+fn remote_server_restart_reason(
+    version: Option<&str>,
+    protocol: Option<u32>,
+    remote_binary_changed: bool,
+) -> Option<RemoteServerRestartReason> {
+    if protocol != Some(CURRENT_PROTOCOL) {
+        return Some(RemoteServerRestartReason::ProtocolMismatch);
+    }
+    if remote_binary_changed {
+        return Some(RemoteServerRestartReason::BinaryUpdated);
+    }
+    if version != Some(CURRENT_VERSION) {
+        return Some(RemoteServerRestartReason::VersionMismatch);
+    }
+    None
 }
 
 fn remote_server_status(
@@ -468,6 +577,7 @@ fn remote_server_status(
 
     if stdout.lines().any(|line| line.trim() == "status: running") {
         return Ok(RemoteServerStatus::Running {
+            version: parse_status_version(&stdout).map(str::to_owned),
             protocol: parse_status_protocol(&stdout),
         });
     }
@@ -478,49 +588,127 @@ fn remote_server_status(
     )))
 }
 
-fn parse_status_protocol(status: &str) -> Option<u32> {
+fn parse_status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
     status.lines().find_map(|line| {
-        let (_, value) = line.trim().split_once(':')?;
-        (line.trim_start().starts_with("protocol:")).then(|| value.trim().parse().ok())?
+        let line = line.trim();
+        let (found_key, value) = line.split_once(':')?;
+        (found_key == key).then_some(value.trim())
     })
 }
 
-fn confirm_remote_server_stop(target: &str, protocol: Option<u32>) -> io::Result<()> {
+fn parse_status_version(status: &str) -> Option<&str> {
+    parse_status_value(status, "version")
+}
+
+fn parse_status_protocol(status: &str) -> Option<u32> {
+    parse_status_value(status, "protocol")?.parse().ok()
+}
+
+fn confirm_remote_server_stop(
+    target: &str,
+    version: Option<&str>,
+    protocol: Option<u32>,
+    reason: RemoteServerRestartReason,
+) -> io::Result<bool> {
     if !io::stdin().is_terminal() {
-        return Err(io::Error::other(format!(
-            "remote herdr server on {target} is running with protocol {}, but this client needs protocol {CURRENT_PROTOCOL}; run from an interactive terminal to approve stopping it",
-            protocol_label(protocol)
-        )));
+        if reason == RemoteServerRestartReason::ProtocolMismatch {
+            return Err(io::Error::other(format!(
+                "remote herdr server on {target} is running with protocol {}, but this client needs protocol {CURRENT_PROTOCOL}; run from an interactive terminal to approve stopping it",
+                protocol_label(protocol)
+            )));
+        }
+
+        eprintln!(
+            "remote herdr server on {target} is still running v{}; it will use v{CURRENT_VERSION} after it restarts.",
+            version_label(version)
+        );
+        return Ok(false);
     }
 
+    eprintln!("remote herdr server on {target} is currently running:");
     eprintln!(
-        "remote herdr server on {target} is running with protocol {}, but this client needs protocol {CURRENT_PROTOCOL}.",
+        "  server: v{} protocol {}",
+        version_label(version),
         protocol_label(protocol)
     );
-    eprint!("Install/replace the remote binary if needed and stop the running remote server now? This will kill the remote Herdr server. [Y/n] ");
+    eprintln!("  prepared binary: v{CURRENT_VERSION} protocol {CURRENT_PROTOCOL}");
+    eprintln!();
+
+    match reason {
+        RemoteServerRestartReason::ProtocolMismatch => {
+            eprintln!(
+                "the remote server protocol does not match this client. the remote server must be stopped before attaching."
+            );
+        }
+        RemoteServerRestartReason::BinaryUpdated => {
+            eprintln!(
+                "the remote herdr binary was installed or replaced. restart the remote server so it uses the prepared binary."
+            );
+        }
+        RemoteServerRestartReason::VersionMismatch => {
+            eprintln!(
+                "the remote server is still running a different herdr version. restart it so it uses the prepared binary."
+            );
+        }
+    }
+
+    let prompt = if reason == RemoteServerRestartReason::ProtocolMismatch {
+        "stop the remote server and continue attaching? [Y/n] "
+    } else {
+        "restart the remote server now? [Y/n] "
+    };
+    eprint!("{prompt}");
     io::stderr().flush()?;
 
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     let answer = answer.trim().to_ascii_lowercase();
     if answer == "n" || answer == "no" {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "remote herdr server replacement cancelled",
-        ));
+        if reason == RemoteServerRestartReason::ProtocolMismatch {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote herdr server stop cancelled",
+            ));
+        }
+        return Ok(false);
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn stop_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
     let command = format!("{} server stop", remote_herdr.shell_path);
     let output = ssh_output(target, &command)?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(command_failed("remote server stop failed", &output))
+    if !output.status.success() {
+        return Err(command_failed("remote server stop failed", &output));
     }
+
+    wait_for_remote_server_shutdown(target, remote_herdr)?;
+    eprintln!("stopped the remote herdr server on {target}; it will restart when the remote client bridge attaches.");
+    Ok(())
+}
+
+fn wait_for_remote_server_shutdown(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+    let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
+    loop {
+        if remote_server_status(target, remote_herdr)? == RemoteServerStatus::NotRunning {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "shutdown was requested, but the old remote herdr server on {target} is still responding after {} seconds",
+                    REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        thread::sleep(REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL);
+    }
+}
+
+fn version_label(version: Option<&str>) -> &str {
+    version.unwrap_or("unknown")
 }
 
 fn protocol_label(protocol: Option<u32>) -> String {
@@ -718,9 +906,18 @@ fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> Stri
     command
 }
 
-fn reattach_command(program: &str, target: &str, session_name: &str) -> String {
+fn reattach_command(
+    program: &str,
+    target: &str,
+    session_name: &str,
+    keybindings: RemoteKeybindings,
+) -> String {
     let program = if program.is_empty() { "herdr" } else { program };
     let mut command = format!("{} --remote {}", shell_quote(program), shell_quote(target));
+    if keybindings != RemoteKeybindings::Local {
+        command.push_str(" --remote-keybindings ");
+        command.push_str(keybindings.as_str());
+    }
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
@@ -889,7 +1086,11 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
     }
 }
 
-fn run_client_process(local_socket: &Path, reattach_command: &str) -> io::Result<()> {
+fn run_client_process(
+    local_socket: &Path,
+    reattach_command: &str,
+    keybindings: RemoteKeybindings,
+) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let status = Command::new(exe)
         .arg("client")
@@ -899,6 +1100,7 @@ fn run_client_process(local_socket: &Path, reattach_command: &str) -> io::Result
         )
         .env("HERDR_RENDER_ENCODING", "terminal-ansi")
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
+        .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1018,7 +1220,9 @@ mod tests {
         ];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
         assert_eq!(cleaned, vec!["herdr", "--help"]);
-        assert_eq!(remote.unwrap().target, "dev");
+        let remote = remote.unwrap();
+        assert_eq!(remote.target, "dev");
+        assert_eq!(remote.keybindings, RemoteKeybindings::Local);
     }
 
     #[test]
@@ -1026,7 +1230,56 @@ mod tests {
         let args = vec!["herdr".into(), "--remote=user@host".into()];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
         assert_eq!(cleaned, vec!["herdr"]);
-        assert_eq!(remote.unwrap().target, "user@host");
+        let remote = remote.unwrap();
+        assert_eq!(remote.target, "user@host");
+        assert_eq!(remote.keybindings, RemoteKeybindings::Local);
+    }
+
+    #[test]
+    fn extract_remote_args_accepts_remote_keybindings_server() {
+        let args = vec![
+            "herdr".into(),
+            "--remote".into(),
+            "dev".into(),
+            "--remote-keybindings=server".into(),
+        ];
+        let (cleaned, remote) = extract_remote_args(&args).unwrap();
+        assert_eq!(cleaned, vec!["herdr"]);
+        let remote = remote.unwrap();
+        assert_eq!(remote.target, "dev");
+        assert_eq!(remote.keybindings, RemoteKeybindings::Server);
+    }
+
+    #[test]
+    fn extract_remote_args_accepts_remote_keybindings_space_form() {
+        let args = vec![
+            "herdr".into(),
+            "--remote=dev".into(),
+            "--remote-keybindings".into(),
+            "server".into(),
+        ];
+        let (cleaned, remote) = extract_remote_args(&args).unwrap();
+        assert_eq!(cleaned, vec!["herdr"]);
+        assert_eq!(remote.unwrap().keybindings, RemoteKeybindings::Server);
+    }
+
+    #[test]
+    fn extract_remote_args_rejects_remote_keybindings_without_remote() {
+        let args = vec!["herdr".into(), "--remote-keybindings=server".into()];
+        let err = extract_remote_args(&args).unwrap_err();
+        assert_eq!(err, "--remote-keybindings requires --remote");
+    }
+
+    #[test]
+    fn extract_remote_args_rejects_duplicate_remote_keybindings() {
+        let args = vec![
+            "herdr".into(),
+            "--remote=dev".into(),
+            "--remote-keybindings=local".into(),
+            "--remote-keybindings=server".into(),
+        ];
+        let err = extract_remote_args(&args).unwrap_err();
+        assert_eq!(err, "--remote-keybindings can only be specified once");
     }
 
     #[test]
@@ -1086,12 +1339,31 @@ mod tests {
     #[test]
     fn reattach_command_includes_remote_and_session() {
         assert_eq!(
-            reattach_command("target/release/herdr", "user@host", "work"),
+            reattach_command(
+                "target/release/herdr",
+                "user@host",
+                "work",
+                RemoteKeybindings::Local,
+            ),
             "target/release/herdr --remote user@host --session work"
         );
         assert_eq!(
-            reattach_command("herdr", "host name", crate::session::DEFAULT_SESSION_NAME),
+            reattach_command(
+                "herdr",
+                "host name",
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteKeybindings::Local,
+            ),
             "herdr --remote 'host name'"
+        );
+        assert_eq!(
+            reattach_command(
+                "herdr",
+                "host",
+                crate::session::DEFAULT_SESSION_NAME,
+                RemoteKeybindings::Server,
+            ),
+            "herdr --remote host --remote-keybindings server"
         );
     }
 
@@ -1221,6 +1493,51 @@ mod tests {
             None
         );
         assert_eq!(parse_status_protocol("status: not running"), None);
+    }
+
+    #[test]
+    fn parse_status_version_reads_version_line() {
+        assert_eq!(
+            parse_status_version("status: running\nversion: 0.6.0\nprotocol: 8"),
+            Some("0.6.0")
+        );
+        assert_eq!(parse_status_version("status: not running"), None);
+    }
+
+    #[test]
+    fn remote_server_restart_reason_requires_stop_for_protocol_mismatch() {
+        assert_eq!(
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(0), false),
+            Some(RemoteServerRestartReason::ProtocolMismatch)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_offers_restart_after_binary_update() {
+        assert_eq!(
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), true),
+            Some(RemoteServerRestartReason::BinaryUpdated)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_offers_restart_for_version_mismatch() {
+        assert_eq!(
+            remote_server_restart_reason(Some("0.0.0"), Some(CURRENT_PROTOCOL), false),
+            Some(RemoteServerRestartReason::VersionMismatch)
+        );
+        assert_eq!(
+            remote_server_restart_reason(None, Some(CURRENT_PROTOCOL), false),
+            Some(RemoteServerRestartReason::VersionMismatch)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_allows_current_server() {
+        assert_eq!(
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), false),
+            None
+        );
     }
 
     #[test]
